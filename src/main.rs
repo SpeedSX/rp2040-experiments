@@ -4,6 +4,8 @@
 #![no_std]
 #![no_main]
 
+use core::fmt::Write;
+
 use bsp::{
     entry,
     hal::{fugit::RateExtU32, gpio, spi},
@@ -27,13 +29,16 @@ use bsp::hal::{
     watchdog::Watchdog,
 };
 
+use heapless::String;
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::{SerialPort, USB_CLASS_CDC};
+
 #[entry]
 fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let sio = Sio::new(pac.SIO);
 
     // External high-speed crystal on the pico board is 12Mhz
     let external_xtal_freq_hz = 12_000_000u32;
@@ -49,9 +54,7 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay: Delay =
-        cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
+    let sio = Sio::new(pac.SIO);
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -59,16 +62,61 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // This is the correct pin on the Raspberry Pico board. On other boards, even if they have an
-    // on-board LED, it might need to be changed.
-    //
-    // Notably, on the Pico W, the LED is not connected to any of the RP2040 GPIOs but to the cyw43 module instead.
-    // One way to do that is by using [embassy](https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/wifi_blinky.rs)
-    //
-    // If you have a Pico W and want to toggle a LED with a simple GPIO output pin, you can connect an external
-    // LED to one of the GPIO pins, and reference that pin here. Don't forget adding an appropriate resistor
-    // in series with the LED.
-    let mut led_pin = pins.gpio15.into_push_pull_output();
+    // Set up the USB driver
+    let usb_bus = UsbBusAllocator::new(bsp::hal::usb::UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
+
+    // Set up the USB Communications Class Device driver
+    let mut serial = SerialPort::new(&usb_bus);
+
+    // Create a USB device with a fake VID and PID
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+        .manufacturer("Fake company")
+        .product("Serial port")
+        .serial_number("TEST")
+        .device_class(USB_CLASS_CDC) // from: https://www.usb.org/defined-class-codes
+        .device_sub_class(2)
+        .build();
+
+    let _ = serial.write(b"Hello, World!\r\n");
+
+    // Check for new data
+    if usb_dev.poll(&mut [&mut serial]) {
+        let mut buf = [0u8; 64];
+        match serial.read(&mut buf) {
+            Err(_e) => {
+                // Do nothing
+            }
+            Ok(0) => {
+                // Do nothing
+            }
+            Ok(count) => {
+                // Convert to upper case
+                buf.iter_mut().take(count).for_each(|b| {
+                    b.make_ascii_uppercase();
+                });
+                // Send back to the host
+                let mut wr_ptr = &buf[..count];
+                while !wr_ptr.is_empty() {
+                    match serial.write(wr_ptr) {
+                        Ok(len) => wr_ptr = &wr_ptr[len..],
+                        // On error, just drop unwritten data.
+                        // One possible error is Err(WouldBlock), meaning the USB
+                        // write buffer is full.
+                        Err(_) => break,
+                    };
+                }
+            }
+        }
+    }
+
+    let mut delay: Delay =
+        cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     // Set up our SPI pins into the correct mode
     let spi_sclk: gpio::Pin<_, gpio::FunctionSpi, gpio::PullNone> = pins.gpio2.reconfigure();
@@ -107,28 +155,26 @@ fn main() -> ! {
     display.set_intensity(0, 0x1).unwrap();
 
     loop {
+        let mut text: String<64> = String::new();
+
+        writeln!(&mut text, "Here").unwrap();
+
+        // This only works reliably because the number of bytes written to
+        // the serial port is smaller than the buffers available to the USB
+        // peripheral. In general, the return value should be handled, so that
+        // bytes not transferred yet don't get lost.
+        let _ = serial.write(text.as_bytes());
+
         show_message(&mut display, &mut delay, "Hello", &CP437_FONT);
 
         display.write_raw(0, &frame).unwrap();
 
         delay.delay_ms(600);
 
-        //display.clear_display(0).unwrap();
-        //delay.delay_ms(500);
-
-        //let dots = 0b0000_0000;
-        //display.write_str(0, b"H.......", dots).unwrap();
-
         display.clear_display(0).unwrap();
-        //clear(&mut display, &mut delay);
         delay.delay_ms(600);
-
-        // info!("on!");
-        // led_pin.set_high().unwrap();
-        // delay.delay_ms(500);
-        // info!("off!");
-        // led_pin.set_low().unwrap();
-        // delay.delay_ms(500);
+        clear_s(&mut display, &mut delay);
+        delay.delay_ms(600);
 
         for i in 0..8 {
             frame[i] = rol_u8(frame[i], i as u8);
@@ -172,7 +218,11 @@ fn show_message<SPI: blocking::spi::write::Default<u8>, CS: OutputPin>(
     scroll_left(display, delay, prev as u8, b' ', font);
 }
 
-fn clear<SPI: blocking::spi::write::Default<u8>, CS: OutputPin>(
+fn rol_u8(value: u8, shift: u8) -> u8 {
+    (value << shift) | (value >> (8 - shift))
+}
+
+fn clear_s<SPI: blocking::spi::write::Default<u8>, CS: OutputPin>(
     display: &mut MAX7219<SpiConnectorSW<SPI, CS>>,
     delay: &mut Delay,
 ) {
@@ -180,10 +230,6 @@ fn clear<SPI: blocking::spi::write::Default<u8>, CS: OutputPin>(
         display.write_raw_byte(0, col as u8, 0u8).unwrap();
         delay.delay_ms(1);
     }
-}
-
-fn rol_u8(value: u8, shift: u8) -> u8 {
-    (value << shift) | (value >> (8 - shift))
 }
 
 static CP437_FONT: [[u8; 8]; 256] = [
