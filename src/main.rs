@@ -1,49 +1,70 @@
-//! Blinks the LED on a Pico board
+//! # Pico USB Serial Example
 //!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
+//! Creates a USB Serial device on a Pico board, with the USB driver running in
+//! the main thread.
+//!
+//! This will create a USB Serial device echoing anything it receives. Incoming
+//! ASCII characters are converted to upercase, so you can tell it is working
+//! and not just local-echo!
+//!
+//! See the `Cargo.toml` file for Copyright and license details.
+
 #![no_std]
 #![no_main]
 
-use core::fmt::Write;
-
-use bsp::{
-    entry,
-    hal::{fugit::RateExtU32, gpio, spi},
-};
 use cortex_m::delay::Delay;
-use defmt::*;
-use defmt_rtt as _;
 use embedded_hal::{blocking, digital::v2::OutputPin};
-use max7219::{connectors::SpiConnectorSW, MAX7219};
-use panic_probe as _;
-
-// Provide an alias for our BSP so we can switch targets quickly.
-// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
-use rp_pico as bsp;
-// use sparkfun_pro_micro_rp2040 as bsp;
-
-use bsp::hal::{
-    clocks::{init_clocks_and_plls, Clock},
-    pac,
-    sio::Sio,
-    watchdog::Watchdog,
+use max7219::{connectors::SpiConnectorSW, DataError, MAX7219};
+// The macro for our start-up function
+use rp_pico::{
+    entry,
+    hal::{fugit::RateExtU32, gpio, spi, Clock},
 };
 
-use heapless::String;
-use usb_device::{class_prelude::*, prelude::*};
-use usbd_serial::{SerialPort, USB_CLASS_CDC};
+// Ensure we halt the program on panic (if we don't mention this crate it won't
+// be linked)
+use panic_halt as _;
 
+// A shorter alias for the Peripheral Access Crate, which provides low-level
+// register access
+use rp_pico::hal::pac;
+
+// A shorter alias for the Hardware Abstraction Layer, which provides
+// higher-level drivers.
+use rp_pico::hal;
+
+// USB Device support
+use usb_device::{class_prelude::*, prelude::*};
+
+// USB Communications Class Device support
+use usbd_serial::SerialPort;
+
+// Used to demonstrate writing formatted strings
+use core::fmt::Write;
+use heapless::String;
+
+/// Entry point to our bare-metal application.
+///
+/// The `#[entry]` macro ensures the Cortex-M start-up code calls this function
+/// as soon as all global variables are initialised.
+///
+/// The function configures the RP2040 peripherals, then echoes any characters
+/// received over USB Serial.
 #[entry]
 fn main() -> ! {
-    info!("Program start");
+    // Grab our singleton objects
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
 
-    // External high-speed crystal on the pico board is 12Mhz
-    let external_xtal_freq_hz = 12_000_000u32;
-    let clocks = init_clocks_and_plls(
-        external_xtal_freq_hz,
+    let core = pac::CorePeripherals::take().unwrap();
+
+    // Set up the watchdog driver - needed by the clock setup code
+    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+
+    // Configure the clocks
+    //
+    // The default is to generate a 125 MHz system clock
+    let clocks = hal::clocks::init_clocks_and_plls(
+        rp_pico::XOSC_CRYSTAL_FREQ,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -54,8 +75,10 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let sio = Sio::new(pac.SIO);
-    let pins = bsp::Pins::new(
+    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    let sio = hal::Sio::new(pac.SIO);
+    let pins = rp_pico::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
@@ -63,7 +86,7 @@ fn main() -> ! {
     );
 
     // Set up the USB driver
-    let usb_bus = UsbBusAllocator::new(bsp::hal::usb::UsbBus::new(
+    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         pac.USBCTRL_REGS,
         pac.USBCTRL_DPRAM,
         clocks.usb_clock,
@@ -79,41 +102,10 @@ fn main() -> ! {
         .manufacturer("Fake company")
         .product("Serial port")
         .serial_number("TEST")
-        .device_class(USB_CLASS_CDC) // from: https://www.usb.org/defined-class-codes
-        .device_sub_class(2)
+        .device_class(2) // from: https://www.usb.org/defined-class-codes
         .build();
 
-    let _ = serial.write(b"Hello, World!\r\n");
-
-    // Check for new data
-    if usb_dev.poll(&mut [&mut serial]) {
-        let mut buf = [0u8; 64];
-        match serial.read(&mut buf) {
-            Err(_e) => {
-                // Do nothing
-            }
-            Ok(0) => {
-                // Do nothing
-            }
-            Ok(count) => {
-                // Convert to upper case
-                buf.iter_mut().take(count).for_each(|b| {
-                    b.make_ascii_uppercase();
-                });
-                // Send back to the host
-                let mut wr_ptr = &buf[..count];
-                while !wr_ptr.is_empty() {
-                    match serial.write(wr_ptr) {
-                        Ok(len) => wr_ptr = &wr_ptr[len..],
-                        // On error, just drop unwritten data.
-                        // One possible error is Err(WouldBlock), meaning the USB
-                        // write buffer is full.
-                        Err(_) => break,
-                    };
-                }
-            }
-        }
-    }
+    let mut said_hello = false;
 
     let mut delay: Delay =
         cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
@@ -135,49 +127,80 @@ fn main() -> ! {
         embedded_hal::spi::MODE_0,
     );
 
-    let mut display: MAX7219<
-        SpiConnectorSW<
-            spi::Spi<
-                spi::Enabled,
-                pac::SPI0,
-                (
-                    gpio::Pin<gpio::bank0::Gpio3, gpio::FunctionSpi, gpio::PullNone>,
-                    gpio::Pin<gpio::bank0::Gpio4, gpio::FunctionSpi, gpio::PullUp>,
-                    gpio::Pin<gpio::bank0::Gpio2, gpio::FunctionSpi, gpio::PullNone>,
-                ),
-            >,
-            gpio::Pin<gpio::bank0::Gpio5, gpio::FunctionSio<gpio::SioOutput>, gpio::PullDown>,
-        >,
-    > = MAX7219::from_spi_cs(1, spi, spi_cs).unwrap();
+    let mut display = MAX7219::from_spi_cs(1, spi, spi_cs).unwrap();
     display.power_on().unwrap();
 
     let mut frame: [u8; 8] = [0b1000_0001; 8];
     display.set_intensity(0, 0x1).unwrap();
 
+    // TODO: this does not clear screen, but
+    // other calls to write_raw do not work correctly without this line!
+    display.clear_display(0).unwrap();
+
     loop {
-        let mut text: String<64> = String::new();
+        // A welcome message at the beginning
+        if !said_hello && timer.get_counter().ticks() >= 2_000_000 {
+            said_hello = true;
+            let _ = serial.write(b"Hello, World!\r\n");
 
-        writeln!(&mut text, "Here").unwrap();
+            let time = timer.get_counter().ticks();
+            let mut text: String<64> = String::new();
+            writeln!(&mut text, "Current timer ticks: {}", time).unwrap();
 
-        // This only works reliably because the number of bytes written to
-        // the serial port is smaller than the buffers available to the USB
-        // peripheral. In general, the return value should be handled, so that
-        // bytes not transferred yet don't get lost.
-        let _ = serial.write(text.as_bytes());
+            // This only works reliably because the number of bytes written to
+            // the serial port is smaller than the buffers available to the USB
+            // peripheral. In general, the return value should be handled, so that
+            // bytes not transferred yet don't get lost.
+            let _ = serial.write(text.as_bytes());
+        }
 
-        show_message(&mut display, &mut delay, "Hello", &CP437_FONT);
+        // Check for new data
+        if usb_dev.poll(&mut [&mut serial]) {
+            let mut buf = [0u8; 1];
+            match serial.read(&mut buf) {
+                Err(_e) => {
+                    // Do nothing
+                }
+                Ok(0) => {
+                    // Do nothing
+                }
+                Ok(count) => {
+                    // Convert to upper case
+                    buf.iter_mut().take(count).for_each(|b| {
+                        b.make_ascii_uppercase();
+                    });
+                    // Send back to the host
+                    let mut wr_ptr = &buf[..count];
+                    while !wr_ptr.is_empty() {
+                        match serial.write(wr_ptr) {
+                            Ok(len) => wr_ptr = &wr_ptr[len..],
+                            // On error, just drop unwritten data.
+                            // One possible error is Err(WouldBlock), meaning the USB
+                            // write buffer is full.
+                            Err(_) => break,
+                        };
+                    }
 
-        display.write_raw(0, &frame).unwrap();
+                    // let r = clear_s(&mut display, &mut delay);
+                    // if let Err(DataError::Spi) = r {
+                    //     let buf1 = [65; 1];
+                    //     let _ = serial.write(&buf1);
+                    // }
 
-        delay.delay_ms(600);
+                    // if let Err(DataError::Pin) = r {
+                    //     let buf1 = [66; 1];
+                    //     let _ = serial.write(&buf1);
+                    // }
 
-        display.clear_display(0).unwrap();
-        delay.delay_ms(600);
-        clear_s(&mut display, &mut delay);
-        delay.delay_ms(600);
+                    let ascii_str = unsafe { core::str::from_utf8_unchecked(&buf) };
+                    show_message(&mut display, &mut delay, ascii_str, &CP437_FONT);
 
-        for i in 0..8 {
-            frame[i] = rol_u8(frame[i], i as u8);
+                    //display.write_raw(0, &frame).unwrap();
+                    //for i in 0..8 {
+                    //frame[i] = rol_u8(frame[i], i as u8);
+                    //}
+                }
+            }
         }
     }
 }
@@ -225,11 +248,13 @@ fn rol_u8(value: u8, shift: u8) -> u8 {
 fn clear_s<SPI: blocking::spi::write::Default<u8>, CS: OutputPin>(
     display: &mut MAX7219<SpiConnectorSW<SPI, CS>>,
     delay: &mut Delay,
-) {
+) -> Result<(), DataError> {
     for col in 1..9 {
-        display.write_raw_byte(0, col as u8, 0u8).unwrap();
+        display.write_raw_byte(0, col as u8, 0u8)?;
         delay.delay_ms(1);
     }
+
+    Ok(())
 }
 
 static CP437_FONT: [[u8; 8]; 256] = [
